@@ -107,12 +107,57 @@ def compute_periods(omega: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------
 # Seismic helpers
 # ---------------------------------------------------------
+def nscp_base_shear_coefficient(
+    T1: float,
+    SDS: float,
+    SD1: float,
+    TL: float,
+    R: float,
+    Ie: float,
+    S1: float = 0.0,
+) -> Tuple[float, float, float, float, float]:
+    """
+    ASCE/NSCP-style ELF seismic response coefficient.
+
+    Returns
+    -------
+    Cs_final, Cs_basic, Cs_max, Cs_min, T_used
+    """
+    T_used = max(T1, 1e-6)
+    RI = max(R / max(Ie, 1e-9), 1e-9)
+
+    Cs_basic = SDS / RI
+    if T_used <= max(TL, 1e-9):
+        Cs_max = SD1 / (T_used * RI) if SD1 > 0 else Cs_basic
+    else:
+        Cs_max = (SD1 * TL) / (T_used ** 2 * RI) if SD1 > 0 and TL > 0 else Cs_basic
+
+    Cs_min = max(0.044 * SDS * Ie, 0.01)
+    if S1 >= 0.60:
+        Cs_min = max(Cs_min, 0.5 * S1 / RI)
+
+    Cs_final = min(Cs_basic, Cs_max)
+    Cs_final = max(Cs_final, Cs_min)
+    return Cs_final, Cs_basic, Cs_max, Cs_min, T_used
+
+
+
+def nscp_code_base_shear(
+    total_weight_kN: float,
+    T1: float,
+    SDS: float,
+    SD1: float,
+    TL: float,
+    R: float,
+    Ie: float,
+    S1: float = 0.0,
+) -> Tuple[float, float, float, float, float]:
+    Cs_final, Cs_basic, Cs_max, Cs_min, T_used = nscp_base_shear_coefficient(T1, SDS, SD1, TL, R, Ie, S1)
+    return Cs_final * total_weight_kN, Cs_final, Cs_basic, Cs_max, Cs_min
+
+
 def approximate_code_base_shear(total_weight_kN: float, T1: float, SDS: float, R: float, Ie: float) -> float:
-    """
-    Simplified classroom base shear estimate retained from the original app.
-    The vertical ELF distribution below is improved, but this V calculation
-    remains intentionally simplified unless the user manually overrides it.
-    """
+    """Simplified fallback used for the UBC 97 teaching option."""
     T_use = max(T1, 0.05)
     Cs = SDS / max(R / Ie, 1e-9)
     period_factor = min(1.0, max(0.4, 1.0 / math.sqrt(T_use)))
@@ -147,14 +192,36 @@ def distribute_lateral_forces(
     V_kN: float,
     T1: float,
     include_top_force: bool = True,
+    spectrum_family: str = "ASCE / NSCP",
 ) -> Tuple[np.ndarray, float, float, np.ndarray]:
     """
-    ELF vertical distribution closer to NSCP/ASCE format:
-    Fx = Cvx * (V - Ft) + Ft at roof
-    where Cvx = wx hx^k / sum(wx hx^k)
+    Vertical ELF floor-force distribution.
+
+    ASCE / NSCP:
+        Fx = Cvx * (V - Ft) + Ft at roof
+        Cvx = wx * hx^k / sum(wx * hx^k)
+
+    UBC 97:
+        Fx = (V - Ft) * wx * hx / sum(wx * hx) + Ft at roof
+        which corresponds to k = 1.0.
     """
     if V_kN <= 0:
         return np.zeros_like(weights_kN), 0.0, 0.0, np.zeros_like(weights_kN)
+
+    use_ubc97 = spectrum_family.strip().upper() == "UBC 97"
+
+    if use_ubc97:
+        k = 1.0
+        wxhk = weights_kN * heights_m
+        denom = np.sum(wxhk)
+        if denom <= 0:
+            return np.zeros_like(weights_kN), k, 0.0, np.zeros_like(weights_kN)
+
+        cvx = wxhk / denom
+        Ft = compute_top_concentrated_force(T1, V_kN, include_top_force)
+        Fx = cvx * max(V_kN - Ft, 0.0)
+        Fx[-1] += Ft
+        return Fx, k, Ft, cvx
 
     k = vertical_distribution_exponent(T1)
     wxhk = weights_kN * (heights_m ** k)
@@ -409,6 +476,7 @@ with st.sidebar:
     if spectrum_family == "ASCE / NSCP":
         SDS = st.number_input("SDS", min_value=0.05, max_value=2.50, value=0.75, step=0.05)
         SD1 = st.number_input("SD1", min_value=0.02, max_value=2.50, value=0.45, step=0.05)
+        S1 = st.number_input("S1 (for NSCP minimum Cs check when S1 ≥ 0.60)", min_value=0.00, max_value=2.50, value=0.30, step=0.05)
         TL = st.number_input("TL (s)", min_value=1.0, max_value=20.0, value=8.0, step=0.5)
         Ca = 0.0
         Cv = 0.0
@@ -417,6 +485,7 @@ with st.sidebar:
         Cv = st.number_input("Cv", min_value=0.05, max_value=5.00, value=0.64, step=0.05)
         SDS = 2.5 * Ca
         SD1 = Cv
+        S1 = 0.0
         TL = st.number_input("Reference long-period plot limit TL (s)", min_value=1.0, max_value=20.0, value=8.0, step=0.5)
 
     R = st.number_input("Response modification factor R", min_value=1.0, max_value=12.0, value=8.0, step=0.5)
@@ -500,11 +569,23 @@ W_total = float(np.sum(weights_kN))
 # ----------------------------
 # STATIC BASE SHEAR
 # ----------------------------
-Vbase_static_auto = (
-    approximate_code_base_shear(W_total, T1, SDS, R, Ie)
-    if code_basis != "Modal dynamics only"
-    else 0.0
-)
+if code_basis != "Modal dynamics only":
+    if spectrum_family == "ASCE / NSCP":
+        Vbase_static_auto, Cs_final, Cs_basic, Cs_max, Cs_min = nscp_code_base_shear(
+            W_total, T1, SDS, SD1, TL, R, Ie, S1
+        )
+    else:
+        Vbase_static_auto = approximate_code_base_shear(W_total, T1, SDS, R, Ie)
+        Cs_final = Vbase_static_auto / max(W_total, 1e-12)
+        Cs_basic = Cs_final
+        Cs_max = Cs_final
+        Cs_min = Cs_final
+else:
+    Vbase_static_auto = 0.0
+    Cs_final = 0.0
+    Cs_basic = 0.0
+    Cs_max = 0.0
+    Cs_min = 0.0
 
 if base_shear_mode in ["Manual static only", "Manual static and dynamic"]:
     Vbase_static = float(manual_static_base_shear)
@@ -520,6 +601,7 @@ if Vbase_static > 0:
         Vbase_static,
         T1,
         include_top_force=include_top_force,
+        spectrum_family=spectrum_family,
     )
 else:
     static_floor_forces = np.zeros(n_story)
@@ -673,11 +755,24 @@ with res_tab3:
         info2.metric("Roof top force Ft (kN)", f"{Ft_static:,.2f}")
         info3.metric("Sum Fx (kN)", f"{np.sum(static_floor_forces):,.2f}")
 
-        st.info(
-            "Static ELF vertical distribution now uses Cvx = wx hx^k / Σ(wx hx^k), "
-            "with optional roof top concentrated force Ft added to the top floor when applicable. "
-            "The auto base shear V remains a simplified teaching estimate unless manually overridden."
-        )
+        if spectrum_family == "ASCE / NSCP":
+            st.markdown("#### NSCP Base Shear Coefficient Check")
+            cs_df = pd.DataFrame(
+                {
+                    "Parameter": ["Cs basic = SDS/(R/Ie)", "Cs max", "Cs min", "Cs final", "V = Cs W"],
+                    "Value": [Cs_basic, Cs_max, Cs_min, Cs_final, Vbase_static],
+                }
+            )
+            st.dataframe(np.round(cs_df, 6), use_container_width=True)
+            st.info(
+                "Auto static base shear now follows ASCE/NSCP-style ELF logic: V = CsW with basic, maximum, and minimum Cs checks. "
+                "The S1-based minimum is activated when S1 ≥ 0.60."
+            )
+        else:
+            st.info(
+                "Static ELF vertical distribution uses Cvx = wx hx^k / Σ(wx hx^k), with optional roof top concentrated force Ft. "
+                "For the UBC 97 teaching spectrum option, auto static base shear remains a simplified estimate unless manually overridden."
+            )
     else:
         st.warning("Static ELF is disabled in modal dynamics only mode.")
 
@@ -765,8 +860,8 @@ with res_tab5:
             T0 = 0.2 * Ts
             spec_df = pd.DataFrame(
                 {
-                    "Parameter": ["SDS", "SD1", "T0", "Ts", "TL"],
-                    "Value": [SDS, SD1, T0, Ts, TL],
+                    "Parameter": ["SDS", "SD1", "S1", "T0", "Ts", "TL"],
+                    "Value": [SDS, SD1, S1, T0, Ts, TL],
                 }
             )
             st.dataframe(np.round(spec_df, 5), use_container_width=True)
