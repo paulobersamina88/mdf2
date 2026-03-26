@@ -108,6 +108,11 @@ def compute_periods(omega: np.ndarray) -> np.ndarray:
 # Seismic helpers
 # ---------------------------------------------------------
 def approximate_code_base_shear(total_weight_kN: float, T1: float, SDS: float, R: float, Ie: float) -> float:
+    """
+    Simplified classroom base shear estimate retained from the original app.
+    The vertical ELF distribution below is improved, but this V calculation
+    remains intentionally simplified unless the user manually overrides it.
+    """
     T_use = max(T1, 0.05)
     Cs = SDS / max(R / Ie, 1e-9)
     period_factor = min(1.0, max(0.4, 1.0 / math.sqrt(T_use)))
@@ -125,13 +130,43 @@ def vertical_distribution_exponent(T: float) -> float:
 
 
 
-def distribute_lateral_forces(weights_kN: np.ndarray, heights_m: np.ndarray, V_kN: float, T1: float) -> np.ndarray:
+def compute_top_concentrated_force(T1: float, V_kN: float, include_top_force: bool) -> float:
+    """
+    Simple teaching implementation of the ELF top concentrated force Ft.
+    Commonly taken as 0.07 T V, limited to 0.25 V, and omitted for shorter periods.
+    """
+    if not include_top_force or T1 <= 0.7 or V_kN <= 0:
+        return 0.0
+    return min(0.07 * T1 * V_kN, 0.25 * V_kN)
+
+
+
+def distribute_lateral_forces(
+    weights_kN: np.ndarray,
+    heights_m: np.ndarray,
+    V_kN: float,
+    T1: float,
+    include_top_force: bool = True,
+) -> Tuple[np.ndarray, float, float, np.ndarray]:
+    """
+    ELF vertical distribution closer to NSCP/ASCE format:
+    Fx = Cvx * (V - Ft) + Ft at roof
+    where Cvx = wx hx^k / sum(wx hx^k)
+    """
+    if V_kN <= 0:
+        return np.zeros_like(weights_kN), 0.0, 0.0, np.zeros_like(weights_kN)
+
     k = vertical_distribution_exponent(T1)
-    Cvx = weights_kN * (heights_m ** k)
-    s = np.sum(Cvx)
-    if s <= 0:
-        return np.zeros_like(weights_kN)
-    return V_kN * Cvx / s
+    wxhk = weights_kN * (heights_m ** k)
+    denom = np.sum(wxhk)
+    if denom <= 0:
+        return np.zeros_like(weights_kN), k, 0.0, np.zeros_like(weights_kN)
+
+    cvx = wxhk / denom
+    Ft = compute_top_concentrated_force(T1, V_kN, include_top_force)
+    Fx = cvx * max(V_kN - Ft, 0.0)
+    Fx[-1] += Ft
+    return Fx, k, Ft, cvx
 
 
 
@@ -146,16 +181,52 @@ def story_shear_from_floor_forces(floor_forces_kN: np.ndarray) -> np.ndarray:
 
 
 
-def design_spectrum_sa(T: float, SDS: float, SD1: float) -> float:
+def design_spectrum_asce_nscp(T: float, SDS: float, SD1: float, TL: float) -> float:
     T = max(T, 1e-6)
-    Ts = SD1 / SDS if SDS > 1e-9 else 1.0
+    if SDS <= 1e-12:
+        return 0.0
+
+    Ts = SD1 / SDS if SDS > 1e-12 else 1.0
     T0 = 0.2 * Ts
 
     if T <= T0:
         return SDS * (0.4 + 0.6 * T / max(T0, 1e-9))
     if T <= Ts:
         return SDS
-    return SD1 / T
+    if T <= TL:
+        return SD1 / T
+    return SD1 * TL / (T ** 2)
+
+
+
+def design_spectrum_ubc97(T: float, Ca: float, Cv: float) -> float:
+    T = max(T, 1e-6)
+    if Ca <= 1e-12:
+        return 0.0
+
+    Ts = Cv / max(2.5 * Ca, 1e-12)
+    T0 = 0.2 * Ts
+
+    if T <= T0:
+        return Ca * (1.0 + 1.5 * T / max(T0, 1e-9))
+    if T <= Ts:
+        return 2.5 * Ca
+    return Cv / T
+
+
+
+def design_spectrum_sa(
+    T: float,
+    spectrum_family: str,
+    SDS: float,
+    SD1: float,
+    TL: float,
+    Ca: float,
+    Cv: float,
+) -> float:
+    if spectrum_family == "UBC 97":
+        return design_spectrum_ubc97(T, Ca, Cv)
+    return design_spectrum_asce_nscp(T, SDS, SD1, TL)
 
 
 
@@ -307,13 +378,23 @@ def multi_mode_force_plot(mode_force_matrix: np.ndarray):
     return fig
 
 
+
+def spectrum_plot(spectrum_family: str, SDS: float, SD1: float, TL: float, Ca: float, Cv: float):
+    T_vals = np.linspace(0.0, max(4.0, TL + 1.0), 300)
+    Sa_vals = [design_spectrum_sa(T, spectrum_family, SDS, SD1, TL, Ca, Cv) for T in T_vals]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=T_vals, y=Sa_vals, mode="lines", name=spectrum_family))
+    fig.update_layout(title=f"{spectrum_family} Design Response Spectrum", xaxis_title="Period T (s)", yaxis_title="Sa (g)", height=420)
+    return fig
+
+
 # ---------------------------------------------------------
 # UI
 # ---------------------------------------------------------
 st.title("🏢 MDOF Building Dynamics Explorer")
 st.caption(
     "Interactive classroom tool for modal properties, modal seismic forces, SRSS/CQC combination, "
-    "static base shear matching, and manual base shear override for spreadsheet comparison."
+    "static base shear matching, ELF vertical distribution, and response-spectrum comparison."
 )
 
 with st.sidebar:
@@ -322,14 +403,30 @@ with st.sidebar:
     story_h = st.number_input("Typical storey height (m)", min_value=2.5, max_value=6.0, value=3.0, step=0.1)
 
     st.subheader("Seismic Inputs")
-    code_basis = st.selectbox("Teaching basis", ["NSCP / IBC simplified ELF + Response Spectrum", "Modal dynamics only"])
-    SDS = st.number_input("SDS", min_value=0.05, max_value=2.50, value=0.75, step=0.05)
-    SD1 = st.number_input("SD1", min_value=0.02, max_value=2.50, value=0.45, step=0.05)
+    code_basis = st.selectbox("Teaching basis", ["NSCP / IBC / UBC ELF + Response Spectrum", "Modal dynamics only"])
+    spectrum_family = st.selectbox("Response spectrum format", ["ASCE / NSCP", "UBC 97"], index=0)
+
+    if spectrum_family == "ASCE / NSCP":
+        SDS = st.number_input("SDS", min_value=0.05, max_value=2.50, value=0.75, step=0.05)
+        SD1 = st.number_input("SD1", min_value=0.02, max_value=2.50, value=0.45, step=0.05)
+        TL = st.number_input("TL (s)", min_value=1.0, max_value=20.0, value=8.0, step=0.5)
+        Ca = 0.0
+        Cv = 0.0
+    else:
+        Ca = st.number_input("Ca", min_value=0.05, max_value=2.50, value=0.40, step=0.05)
+        Cv = st.number_input("Cv", min_value=0.05, max_value=5.00, value=0.64, step=0.05)
+        SDS = 2.5 * Ca
+        SD1 = Cv
+        TL = st.number_input("Reference long-period plot limit TL (s)", min_value=1.0, max_value=20.0, value=8.0, step=0.5)
+
     R = st.number_input("Response modification factor R", min_value=1.0, max_value=12.0, value=8.0, step=0.5)
     Ie = st.number_input("Importance factor Ie", min_value=0.5, max_value=2.0, value=1.0, step=0.1)
     damping_percent = st.number_input("Damping ratio (%) for CQC", min_value=1.0, max_value=20.0, value=5.0, step=0.5)
     combine_method = st.selectbox("Modal combination method", ["SRSS", "CQC"])
     match_static_base_shear = st.checkbox("Scale combined dynamic results to match static ELF base shear", value=True)
+
+    st.subheader("Static ELF Distribution")
+    include_top_force = st.checkbox("Include roof top concentrated force Ft when applicable", value=True)
 
     st.subheader("Base Shear Control")
     base_shear_mode = st.selectbox(
@@ -416,18 +513,30 @@ else:
     Vbase_static = Vbase_static_auto
     static_source = "Auto"
 
-static_floor_forces = (
-    distribute_lateral_forces(weights_kN, heights_m, Vbase_static, T1)
-    if Vbase_static > 0
-    else np.zeros(n_story)
-)
+if Vbase_static > 0:
+    static_floor_forces, elf_k, Ft_static, cvx = distribute_lateral_forces(
+        weights_kN,
+        heights_m,
+        Vbase_static,
+        T1,
+        include_top_force=include_top_force,
+    )
+else:
+    static_floor_forces = np.zeros(n_story)
+    elf_k = vertical_distribution_exponent(T1)
+    Ft_static = 0.0
+    cvx = np.zeros(n_story)
+
 static_story_shear = story_shear_from_floor_forces(static_floor_forces)
 
 # ----------------------------
 # DYNAMIC BASE SHEAR
 # ----------------------------
 Sa_modes_g = (
-    np.array([design_spectrum_sa(T, SDS, SD1) for T in periods], dtype=float)
+    np.array(
+        [design_spectrum_sa(T, spectrum_family, SDS, SD1, TL, Ca, Cv) for T in periods],
+        dtype=float,
+    )
     if code_basis != "Modal dynamics only"
     else np.zeros_like(periods)
 )
@@ -488,8 +597,8 @@ col3.metric(f"Dynamic Base Shear ({dynamic_source}) (kN)", f"{Vbase_dynamic:,.2f
 col4.metric("Scale Factor to Static", f"{scale_ratio:.3f}")
 col5.metric("1st Mode Mass Participation", f"{eff_mass_ratio[0] * 100:.2f}%")
 
-res_tab1, res_tab2, res_tab3, res_tab4, res_tab5 = st.tabs(
-    ["Visualization", "Modal Properties", "Static ELF", "Dynamic Modal Forces", "Matrices & Downloads"]
+res_tab1, res_tab2, res_tab3, res_tab4, res_tab5, res_tab6 = st.tabs(
+    ["Visualization", "Modal Properties", "Static ELF", "Dynamic Modal Forces", "Spectrum", "Matrices & Downloads"]
 )
 
 with res_tab1:
@@ -550,14 +659,25 @@ with res_tab3:
             static_df = pd.DataFrame(
                 {
                     "Floor": [f"Floor {i+1}" for i in range(n_story)],
-                    "Height_m": heights_m,
+                    "Height_m": np.round(heights_m, 3),
                     "Weight_kN": np.round(weights_kN, 3),
+                    "Cvx": np.round(cvx, 5),
                     "ELF_Fx_kN": np.round(static_floor_forces, 3),
                     "ELF_Story_Shear_kN": np.round(static_story_shear, 3),
                 }
             )
             st.dataframe(static_df, use_container_width=True)
-        st.info("Static ELF here is simplified for classroom use. The dynamic tab shows each modal force pattern and the SRSS/CQC combination.")
+
+        info1, info2, info3 = st.columns(3)
+        info1.metric("ELF vertical exponent k", f"{elf_k:.3f}")
+        info2.metric("Roof top force Ft (kN)", f"{Ft_static:,.2f}")
+        info3.metric("Sum Fx (kN)", f"{np.sum(static_floor_forces):,.2f}")
+
+        st.info(
+            "Static ELF vertical distribution now uses Cvx = wx hx^k / Σ(wx hx^k), "
+            "with optional roof top concentrated force Ft added to the top floor when applicable. "
+            "The auto base shear V remains a simplified teaching estimate unless manually overridden."
+        )
     else:
         st.warning("Static ELF is disabled in modal dynamics only mode.")
 
@@ -632,6 +752,38 @@ with res_tab4:
     )
 
 with res_tab5:
+    s1, s2 = st.columns([1.2, 0.8])
+    with s1:
+        st.plotly_chart(
+            spectrum_plot(spectrum_family, SDS, SD1, TL, Ca, Cv),
+            use_container_width=True,
+            key="spectrum_plot",
+        )
+    with s2:
+        if spectrum_family == "ASCE / NSCP":
+            Ts = SD1 / SDS if SDS > 1e-12 else 0.0
+            T0 = 0.2 * Ts
+            spec_df = pd.DataFrame(
+                {
+                    "Parameter": ["SDS", "SD1", "T0", "Ts", "TL"],
+                    "Value": [SDS, SD1, T0, Ts, TL],
+                }
+            )
+            st.dataframe(np.round(spec_df, 5), use_container_width=True)
+            st.caption("Sa(T): linear rise to T0, plateau to Ts, 1/T branch to TL, and 1/T² branch beyond TL.")
+        else:
+            Ts = Cv / max(2.5 * Ca, 1e-12)
+            T0 = 0.2 * Ts
+            spec_df = pd.DataFrame(
+                {
+                    "Parameter": ["Ca", "Cv", "T0", "Ts", "Plateau Sa"],
+                    "Value": [Ca, Cv, T0, Ts, 2.5 * Ca],
+                }
+            )
+            st.dataframe(np.round(spec_df, 5), use_container_width=True)
+            st.caption("Sa(T): linear rise to T0, plateau = 2.5Ca to Ts, then Cv/T descending branch.")
+
+with res_tab6:
     m1, m2 = st.columns(2)
     with m1:
         st.markdown("#### Mass Matrix M")
@@ -645,6 +797,11 @@ with res_tab5:
     export_static = pd.DataFrame(
         {
             "Floor": [f"Floor {i+1}" for i in range(n_story)],
+            "Height_m": heights_m,
+            "Weight_kN": weights_kN,
+            "Cvx": cvx,
+            "ELF_k": np.full(n_story, elf_k),
+            "ELF_Ft_kN": np.full(n_story, Ft_static),
             "ELF_Fx_kN": static_floor_forces,
             "ELF_Story_Shear_kN": static_story_shear,
         }
@@ -662,6 +819,7 @@ with res_tab5:
     export_base_shear_summary = pd.DataFrame(
         {
             "Parameter": [
+                "Response Spectrum Format",
                 "Static Base Shear Auto",
                 "Static Base Shear Final",
                 "Dynamic Base Shear Auto",
@@ -672,6 +830,7 @@ with res_tab5:
                 "Dynamic Source",
             ],
             "Value": [
+                spectrum_family,
                 Vbase_static_auto,
                 Vbase_static,
                 Vbase_dynamic_auto,
@@ -722,6 +881,6 @@ with res_tab5:
 
 st.markdown("---")
 st.markdown(
-    "**Teaching use:** change floor weights, storey stiffness, SDS, SD1, damping, base shear mode, and mode combination method. "
+    "**Teaching use:** change floor weights, storey stiffness, response-spectrum format, damping, base shear mode, and mode combination method. "
     "Students can then compare static ELF forces, individual modal dynamic forces, combined SRSS/CQC results, and spreadsheet-imposed base shear values."
 )
